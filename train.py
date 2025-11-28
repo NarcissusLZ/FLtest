@@ -12,8 +12,8 @@ from tqdm import tqdm
 import numpy as np
 import datetime
 
-# 导入你的模型文件
-from vgg16 import CIFAR10_VGG16, select_device
+# 【修改点1】导入 CIFAR-100 专用的模型类
+from vgg16 import CIFAR100_VGG16, select_device
 
 # ================= 配置参数 =================
 CONFIG = {
@@ -23,30 +23,40 @@ CONFIG = {
     'lr': 0.01,
     'momentum': 0.9,
     'weight_decay': 5e-4,
-    'save_path': './checkpoints',
-    'analysis_path': './analysis_results',
-    'log_file': 'layer_split_log.txt',  # 新增：日志文件名
+    'save_path': './checkpoints_cifar100',  # 修改保存路径以免混淆
+    'analysis_path': './analysis_results_cifar100',
+    'log_file': 'layer_split_log_cifar100.txt',
     'num_workers': 2
 }
 
 
 def get_data_loaders(batch_size, num_workers):
-    """准备 CIFAR-10 数据集"""
-    print("正在准备数据...")
+    """准备 CIFAR-100 数据集"""
+    print("正在准备 CIFAR-100 数据...")
+
+    # 【修改点2】CIFAR-100 的官方均值和标准差
+    cifar100_mean = (0.5071, 0.4867, 0.4408)
+    cifar100_std = (0.2675, 0.2565, 0.2761)
+
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize(cifar100_mean, cifar100_std),
     ])
+
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize(cifar100_mean, cifar100_std),
     ])
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+
+    # 【修改点3】加载 CIFAR-100 数据集
+    trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+
+    testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
     testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
     return trainloader, testloader
 
 
@@ -90,17 +100,13 @@ def evaluate(model, dataloader, criterion, device):
 
 # ================= 辅助功能：双重日志记录 =================
 def log_and_print(message, log_path):
-    """
-    既打印到控制台，也追加写入文件
-    """
-    print(message)  # 控制台输出
+    print(message)
     with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(message + '\n')  # 文件写入
+        f.write(message + '\n')
 
 
 # ================= 核心逻辑：动态分层算法 =================
 def simple_kmeans_split(values):
-    """简单的1D K-Means (k=2) 实现"""
     data = np.array(values).reshape(-1, 1)
     c1 = np.min(data)
     c2 = np.max(data)
@@ -118,7 +124,6 @@ def simple_kmeans_split(values):
 
 
 def classify_layers_realtime(model):
-    """获取当前L2并分类"""
     layer_l2 = {}
     l2_values = []
 
@@ -143,7 +148,6 @@ def classify_layers_realtime(model):
 
 
 def record_layer_l2_norms(model, epoch, history_list):
-    """记录数据用于事后绘图"""
     for name, param in model.named_parameters():
         if 'weight' in name:
             l2_val = param.norm(p=2).item()
@@ -167,7 +171,7 @@ def save_and_plot_analysis(history_list, save_dir):
         layer_data = df[df['layer'] == layer_name]
         short_name = layer_name.replace('features.', 'F').replace('dense.', 'D').replace('classifier.', 'C')
         plt.plot(layer_data['epoch'], layer_data['l2_norm'], label=short_name, marker='o', markersize=3)
-    plt.title('Layer L2 Norm Evolution During Training')
+    plt.title('Layer L2 Norm Evolution During Training (CIFAR-100)')
     plt.xlabel('Epoch')
     plt.ylabel('L2 Norm')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
@@ -184,16 +188,16 @@ def main():
     if not os.path.exists(CONFIG['save_path']): os.makedirs(CONFIG['save_path'])
     if not os.path.exists(CONFIG['analysis_path']): os.makedirs(CONFIG['analysis_path'])
 
-    # 初始化日志文件路径
     log_path = os.path.join(CONFIG['analysis_path'], CONFIG['log_file'])
-    # 清空之前的日志（如果需要保留追加，去掉这行 'w' 模式的写入）
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write(f"Training Log - Started at {datetime.datetime.now()}\n")
+        f.write(f"Training Log (CIFAR-100) - Started at {datetime.datetime.now()}\n")
         f.write("Strategy: Real-time Dynamic Split based on Pure L2 Norm\n")
         f.write("=" * 60 + "\n")
 
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
-    model = CIFAR10_VGG16(num_classes=10).to(device)
+
+    # 【修改点4】初始化 CIFAR-100 模型
+    model = CIFAR100_VGG16(num_classes=100).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=CONFIG['lr'], momentum=CONFIG['momentum'],
@@ -202,43 +206,28 @@ def main():
 
     l2_history = []
 
-    log_and_print(f"开始训练 {CONFIG['epochs']} 轮...", log_path)
+    log_and_print(f"开始在 CIFAR-100 上训练 {CONFIG['epochs']} 轮...", log_path)
     log_and_print(f"日志文件位置: {log_path}", log_path)
 
     start_time = time.time()
 
     for epoch in range(CONFIG['epochs']):
-        # 1. 训练
         train_loss, train_acc = train_one_epoch(model, trainloader, criterion, optimizer, device, epoch)
-
-        # 2. 验证
         val_loss, val_acc = evaluate(model, testloader, criterion, device)
-
-        # 3. 记录历史数据
         record_layer_l2_norms(model, epoch, l2_history)
-
-        # 4. 【实时输出】 计算并打印本轮的分层结果
         critical_layers, robust_layers, thresh = classify_layers_realtime(model)
 
-        # 构建要打印和保存的日志信息
         msg = []
         msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        msg.append(f"=" * 20 + " 动态分层 (Only L2) " + "=" * 20)
-        msg.append(f"当前轮次 L2 阈值 (Threshold): {thresh:.4f}")
-
-        msg.append(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
-        # 记录所有关键层名字
+        msg.append(f"=" * 20 + " 动态分层 (CIFAR-100) " + "=" * 20)
+        msg.append(f"当前轮次 L2 阈值: {thresh:.4f}")
+        msg.append(f"🔴 关键层 (Critical, Count={len(critical_layers)}):")
         msg.append(", ".join([x.split(' ')[0] for x in critical_layers]))
-
-        msg.append(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
-        # 鲁棒层通常较多，如果不希望日志太长，可以只记名字
+        msg.append(f"🟢 鲁棒层 (Robust, Count={len(robust_layers)}):")
         msg.append(", ".join([x.split(' ')[0] for x in robust_layers]))
-
         msg.append("=" * 60)
 
-        # 将上面构建的所有信息一次性输出到控制台和文件
         log_and_print("\n".join(msg), log_path)
-
         scheduler.step()
 
     total_time = time.time() - start_time
