@@ -10,6 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
+import datetime
 
 # 导入你的模型文件
 from vgg16 import CIFAR10_VGG16, select_device
@@ -24,6 +25,7 @@ CONFIG = {
     'weight_decay': 5e-4,
     'save_path': './checkpoints',
     'analysis_path': './analysis_results',
+    'log_file': 'layer_split_log.txt',  # 新增：日志文件名
     'num_workers': 2
 }
 
@@ -86,59 +88,48 @@ def evaluate(model, dataloader, criterion, device):
     return running_loss / len(dataloader), 100. * correct / total
 
 
+# ================= 辅助功能：双重日志记录 =================
+def log_and_print(message, log_path):
+    """
+    既打印到控制台，也追加写入文件
+    """
+    print(message)  # 控制台输出
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(message + '\n')  # 文件写入
+
+
 # ================= 核心逻辑：动态分层算法 =================
-
 def simple_kmeans_split(values):
-    """
-    简单的1D K-Means (k=2) 实现，用于将L2范数分为高低两组。
-    无需依赖sklearn，纯numpy实现。
-    """
+    """简单的1D K-Means (k=2) 实现"""
     data = np.array(values).reshape(-1, 1)
-
-    # 初始化中心：最小值和最大值
     c1 = np.min(data)
     c2 = np.max(data)
-
-    for _ in range(10):  # 迭代10次通常足够收敛
-        # 计算距离
+    for _ in range(10):
         dist1 = np.abs(data - c1)
         dist2 = np.abs(data - c2)
-
-        # 分配簇
         group1 = data[dist1 <= dist2]
         group2 = data[dist1 > dist2]
-
-        # 更新中心
         new_c1 = group1.mean() if len(group1) > 0 else c1
         new_c2 = group2.mean() if len(group2) > 0 else c2
-
-        if c1 == new_c1 and c2 == new_c2:
-            break
+        if c1 == new_c1 and c2 == new_c2: break
         c1, c2 = new_c1, new_c2
-
-    # 确定阈值：两个中心的中间点
     threshold = (c1 + c2) / 2
     return threshold
 
 
 def classify_layers_realtime(model):
-    """
-    获取当前所有层L2范数，并进行实时分类
-    """
+    """获取当前L2并分类"""
     layer_l2 = {}
     l2_values = []
 
-    # 1. 收集数据
     for name, param in model.named_parameters():
         if 'weight' in name:
             val = param.norm(p=2).item()
             layer_l2[name] = val
             l2_values.append(val)
 
-    # 2. 计算动态阈值 (只基于L2)
     threshold = simple_kmeans_split(l2_values)
 
-    # 3. 分类
     critical = []
     robust = []
 
@@ -193,6 +184,14 @@ def main():
     if not os.path.exists(CONFIG['save_path']): os.makedirs(CONFIG['save_path'])
     if not os.path.exists(CONFIG['analysis_path']): os.makedirs(CONFIG['analysis_path'])
 
+    # 初始化日志文件路径
+    log_path = os.path.join(CONFIG['analysis_path'], CONFIG['log_file'])
+    # 清空之前的日志（如果需要保留追加，去掉这行 'w' 模式的写入）
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write(f"Training Log - Started at {datetime.datetime.now()}\n")
+        f.write("Strategy: Real-time Dynamic Split based on Pure L2 Norm\n")
+        f.write("=" * 60 + "\n")
+
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
     model = CIFAR10_VGG16(num_classes=10).to(device)
 
@@ -203,8 +202,8 @@ def main():
 
     l2_history = []
 
-    print(f"开始训练 {CONFIG['epochs']} 轮...")
-    print("注意：每轮结束后将基于纯 L2 范数动态输出关键层/鲁棒层划分")
+    log_and_print(f"开始训练 {CONFIG['epochs']} 轮...", log_path)
+    log_and_print(f"日志文件位置: {log_path}", log_path)
 
     start_time = time.time()
 
@@ -221,23 +220,31 @@ def main():
         # 4. 【实时输出】 计算并打印本轮的分层结果
         critical_layers, robust_layers, thresh = classify_layers_realtime(model)
 
-        print(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        print(f"=" * 20 + " 动态分层 (Only L2) " + "=" * 20)
-        print(f"划分阈值 (Threshold): {thresh:.4f}")
-        print(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
-        # 打印前5个和后5个，避免刷屏，或者根据层数决定是否全打印
-        # 这里为了直观，如果层数不多则全打印，VGG层数较多，我们可以紧凑打印
-        print(", ".join([x.split(' ')[0] for x in critical_layers]))  # 只打印名字
+        # 构建要打印和保存的日志信息
+        msg = []
+        msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+        msg.append(f"=" * 20 + " 动态分层 (Only L2) " + "=" * 20)
+        msg.append(f"当前轮次 L2 阈值 (Threshold): {thresh:.4f}")
 
-        print(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
-        # 打印鲁棒层的数量和简要信息
-        print(f"Includes {len(robust_layers)} layers with L2 < {thresh:.4f}")
-        print("=" * 60 + "\n")
+        msg.append(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
+        # 记录所有关键层名字
+        msg.append(", ".join([x.split(' ')[0] for x in critical_layers]))
+
+        msg.append(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
+        # 鲁棒层通常较多，如果不希望日志太长，可以只记名字
+        msg.append(", ".join([x.split(' ')[0] for x in robust_layers]))
+
+        msg.append("=" * 60)
+
+        # 将上面构建的所有信息一次性输出到控制台和文件
+        log_and_print("\n".join(msg), log_path)
 
         scheduler.step()
 
     total_time = time.time() - start_time
-    print(f"\n训练结束，耗时 {total_time / 60:.2f} 分钟。")
+    final_msg = f"\n训练结束，耗时 {total_time / 60:.2f} 分钟。"
+    log_and_print(final_msg, log_path)
+
     save_and_plot_analysis(l2_history, CONFIG['analysis_path'])
 
 
