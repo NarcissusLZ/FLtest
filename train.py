@@ -24,12 +24,11 @@ CONFIG = {
     'weight_decay': 5e-4,
     'save_path': './checkpoints_cifar100',
     'analysis_path': './analysis_results_cifar100',
-    'log_file': 'layer_split_log_final.txt',
+    'log_file': 'layer_split_log_fix.txt',
     'num_workers': 2
 }
 
 
-# ... (数据加载和训练函数保持不变，省略以节省篇幅，直接使用之前的即可) ...
 def get_data_loaders(batch_size, num_workers):
     print("正在准备 CIFAR-100 数据...")
     cifar100_mean = (0.5071, 0.4867, 0.4408)
@@ -96,94 +95,96 @@ def log_and_print(message, log_path):
 
 
 def record_layer_metrics(model, epoch, history_list):
-    # 此函数仅用于记录原始数据，不做加权，保证 CSV 数据的纯净性
     for name, param in model.named_parameters():
         if 'weight' in name and len(param.shape) > 1:
             l2_val = param.norm(p=2).item()
-            num_params = param.numel()
-            rms_val = (l2_val / np.sqrt(num_params)) * 100
             history_list.append({
                 'epoch': epoch + 1,
                 'layer': name,
-                'l2_norm': l2_val,
-                'rms_score': rms_val
+                'l2_norm': l2_val
             })
 
 
 def save_and_plot_analysis(history_list, save_dir):
     if not os.path.exists(save_dir): os.makedirs(save_dir)
     df = pd.DataFrame(history_list)
-    df.to_csv(os.path.join(save_dir, 'training_metrics_final.csv'), index=False)
-    # (绘图代码略，与之前相同)
+    df.to_csv(os.path.join(save_dir, 'training_metrics_fix.csv'), index=False)
+    # 简单的 L2 趋势图
+    plt.figure(figsize=(12, 8))
+    for layer_name in df['layer'].unique():
+        layer_data = df[df['layer'] == layer_name]
+        short_name = layer_name.replace('features.', 'F').replace('dense.', 'D')
+        plt.plot(layer_data['epoch'], layer_data['l2_norm'], label=short_name, marker='o', markersize=3)
+    plt.title('Layer L2 Norm Evolution')
+    plt.savefig(os.path.join(save_dir, 'l2_fix_plot.png'), dpi=300)
 
 
-# ================= 【核心修改】 混合加权评分策略 =================
+# ================= 【核心修改】 L2 + 结构权重 + 对数聚类 =================
 
-def kmeans_split_auto(values):
-    """自动 K-Means (k=2)"""
-    data = np.array(values).reshape(-1, 1)
-    if len(data) < 2: return data[0][0]
+def kmeans_split_log_space(values):
+    """
+    在对数空间进行 K-Means (k=2)，能更好地处理数量级差异
+    比如: [6, 12, 20] -> Log: [1.8, 2.5, 3.0]
+    Threshold ~ 2.4 (Log) -> ~11 (Linear)
+    这样 12 和 20 都会被划分为 High，而 6 是 Low。
+    """
+    data = np.array(values)
+    # 避免 log(0)
+    data_log = np.log(data + 1e-6).reshape(-1, 1)
 
-    # 简单的 k=2 聚类
-    c1, c2 = np.min(data), np.max(data)
+    if len(data) < 2: return np.exp(data_log[0][0])
+
+    c1, c2 = np.min(data_log), np.max(data_log)
     for _ in range(10):
-        dist1 = np.abs(data - c1)
-        dist2 = np.abs(data - c2)
-        group1 = data[dist1 <= dist2]
-        group2 = data[dist1 > dist2]
+        dist1 = np.abs(data_log - c1)
+        dist2 = np.abs(data_log - c2)
+        group1 = data_log[dist1 <= dist2]
+        group2 = data_log[dist1 > dist2]
         new_c1 = group1.mean() if len(group1) > 0 else c1
         new_c2 = group2.mean() if len(group2) > 0 else c2
         if c1 == new_c1 and c2 == new_c2: break
         c1, c2 = new_c1, new_c2
 
-    return (c1 + c2) / 2
+    thresh_log = (c1 + c2) / 2
+    return np.exp(thresh_log)  # 还原回线性空间
 
 
-def classify_layers_final(model):
+def classify_layers_fix(model):
     layer_scores = {}
     score_values = []
 
     for name, param in model.named_parameters():
         if 'weight' in name:
-            # 1. 过滤掉 BN 层 (一维参数)
+            # 1. 过滤 BN 层
             if len(param.shape) <= 1: continue
 
-            # 2. 计算基础 RMS 分数 (能量密度)
+            # 2. 回归单纯的 L2 范数 (Dense 层会天然很高)
             l2_val = param.norm(p=2).item()
-            num_params = param.numel()
-            base_score = (l2_val / np.sqrt(num_params)) * 100
 
-            # 3. 应用位置加权 (Positional Weighting)
-            # 这是为了弥补纯统计指标的不足，符合 "First & Last layers matter most" 原则
-            weighted_score = base_score
+            # 3. 结构性加权 (Structural Weighting)
+            # 这里的目的是让 First Layer 也能达到 Dense Layer 的数量级
+            weighted_l2 = l2_val
 
-            if "dense" in name or "classifier" in name:
-                weighted_score *= 2.0  # 全连接层大幅加分
-            elif "features.3" in name or "features.4" in name:
-                # 深层卷积 (根据VGG结构，30层往后算深层)
-                # 这里简单通过序号判断，VGG16 features结构比较长
-                # 我们可以解析名字中的数字，数字大的加分
-                try:
-                    layer_idx = int(name.split('.')[1])
-                    if layer_idx > 20:  # 假设20层以后的卷积更重要
-                        weighted_score *= 1.3
-                except:
-                    pass
-            elif "features.0" in name:
-                weighted_score *= 1.5  # 第一层极其重要，加分
+            if "features.0" in name:
+                weighted_l2 *= 4.0  # 第一层 L2通常~6, x4后~24 (媲美Dense)
+            elif "classifier" in name:
+                weighted_l2 *= 2.0  # 分类头
+            # 深层卷积 (Deep Conv) 和 全连接 (Dense) 不需要加权
+            # 因为 Deep Conv L2 通常 ~12，Dense L2 通常 ~20
+            # 它们自然比 Shallow Conv (~6) 高，会被对数聚类自动分到 High 组
 
-            layer_scores[name] = weighted_score
-            score_values.append(weighted_score)
+            layer_scores[name] = weighted_l2
+            score_values.append(weighted_l2)
 
-    # 4. 动态阈值划分
-    threshold = kmeans_split_auto(score_values)
+    # 4. 对数空间动态划分
+    threshold = kmeans_split_log_space(score_values)
 
     critical = []
     robust = []
 
     for name, val in layer_scores.items():
         if val >= threshold:
-            critical.append(f"{name}")  # 简洁输出
+            critical.append(f"{name}")
         else:
             robust.append(f"{name}")
 
@@ -198,13 +199,12 @@ def main():
 
     log_path = os.path.join(CONFIG['analysis_path'], CONFIG['log_file'])
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write(f"Training Log (Final) - {datetime.datetime.now()}\n")
-        f.write("Strategy: RMS Score * Positional Weights (Heuristic)\n")
-        f.write("Weights: Dense(x2.0), DeepConv(x1.3), FirstConv(x1.5)\n")
+        f.write(f"Training Log (Fix) - {datetime.datetime.now()}\n")
+        f.write("Strategy: L2 Norm (Base) + Log-Space Clustering + First Layer Boost\n")
         f.write("=" * 60 + "\n")
 
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
-    model = CIFAR100_VGG16(num_classes=100).to(device)  # 使用 CIFAR100 模型
+    model = CIFAR100_VGG16(num_classes=100).to(device)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=CONFIG['lr'], momentum=CONFIG['momentum'],
@@ -212,7 +212,7 @@ def main():
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
     history = []
 
-    log_and_print(f"开始训练 (Final 策略)...", log_path)
+    log_and_print(f"开始训练 (Fix 策略)...", log_path)
     start_time = time.time()
 
     for epoch in range(CONFIG['epochs']):
@@ -220,11 +220,11 @@ def main():
         val_loss, val_acc = evaluate(model, testloader, criterion, device)
 
         record_layer_metrics(model, epoch, history)
-        critical_layers, robust_layers, thresh = classify_layers_final(model)
+        critical_layers, robust_layers, thresh = classify_layers_fix(model)
 
         msg = []
         msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        msg.append(f"Threshold: {thresh:.2f}")
+        msg.append(f"Weighted L2 Threshold: {thresh:.2f}")
         msg.append(f"🔴 Critical (TCP): {', '.join(critical_layers)}")
         msg.append(f"🟢 Robust (UDP):  {', '.join(robust_layers)}")
         msg.append("-" * 60)
