@@ -9,6 +9,7 @@ import time
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import numpy as np
 
 # 导入你的模型文件
 from vgg16 import CIFAR10_VGG16, select_device
@@ -22,7 +23,7 @@ CONFIG = {
     'momentum': 0.9,
     'weight_decay': 5e-4,
     'save_path': './checkpoints',
-    'analysis_path': './analysis_results',  # 新增：分析结果保存路径
+    'analysis_path': './analysis_results',
     'num_workers': 2
 }
 
@@ -85,13 +86,74 @@ def evaluate(model, dataloader, criterion, device):
     return running_loss / len(dataloader), 100. * correct / total
 
 
-# ================= 新增：记录L2范数的函数 =================
-def record_layer_l2_norms(model, epoch, history_list):
+# ================= 核心逻辑：动态分层算法 =================
+
+def simple_kmeans_split(values):
     """
-    计算当前模型所有层的L2范数，并追加到 history_list 中
+    简单的1D K-Means (k=2) 实现，用于将L2范数分为高低两组。
+    无需依赖sklearn，纯numpy实现。
     """
+    data = np.array(values).reshape(-1, 1)
+
+    # 初始化中心：最小值和最大值
+    c1 = np.min(data)
+    c2 = np.max(data)
+
+    for _ in range(10):  # 迭代10次通常足够收敛
+        # 计算距离
+        dist1 = np.abs(data - c1)
+        dist2 = np.abs(data - c2)
+
+        # 分配簇
+        group1 = data[dist1 <= dist2]
+        group2 = data[dist1 > dist2]
+
+        # 更新中心
+        new_c1 = group1.mean() if len(group1) > 0 else c1
+        new_c2 = group2.mean() if len(group2) > 0 else c2
+
+        if c1 == new_c1 and c2 == new_c2:
+            break
+        c1, c2 = new_c1, new_c2
+
+    # 确定阈值：两个中心的中间点
+    threshold = (c1 + c2) / 2
+    return threshold
+
+
+def classify_layers_realtime(model):
+    """
+    获取当前所有层L2范数，并进行实时分类
+    """
+    layer_l2 = {}
+    l2_values = []
+
+    # 1. 收集数据
     for name, param in model.named_parameters():
-        # 只记录权重(weight)，不记录偏置(bias)，因为权重更能代表层的重要性
+        if 'weight' in name:
+            val = param.norm(p=2).item()
+            layer_l2[name] = val
+            l2_values.append(val)
+
+    # 2. 计算动态阈值 (只基于L2)
+    threshold = simple_kmeans_split(l2_values)
+
+    # 3. 分类
+    critical = []
+    robust = []
+
+    for name, val in layer_l2.items():
+        if val >= threshold:
+            critical.append(f"{name} ({val:.2f})")
+        else:
+            robust.append(f"{name} ({val:.2f})")
+
+    return critical, robust, threshold
+
+
+def record_layer_l2_norms(model, epoch, history_list):
+    """记录数据用于事后绘图"""
+    for name, param in model.named_parameters():
         if 'weight' in name:
             l2_val = param.norm(p=2).item()
             history_list.append({
@@ -102,41 +164,25 @@ def record_layer_l2_norms(model, epoch, history_list):
 
 
 def save_and_plot_analysis(history_list, save_dir):
-    """
-    保存CSV并绘制折线图
-    """
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-
-    # 1. 保存 CSV
     df = pd.DataFrame(history_list)
     csv_path = os.path.join(save_dir, 'training_l2_history.csv')
     df.to_csv(csv_path, index=False)
-    print(f"\n[Analysis] 详细数据已保存至: {csv_path}")
 
-    # 2. 绘制折线图
     plt.figure(figsize=(12, 8))
-
-    # 获取所有唯一的层名称
     layers = df['layer'].unique()
-
-    # 为每一层画一条线
     for layer_name in layers:
         layer_data = df[df['layer'] == layer_name]
-        # 简化图例名称，去掉 'features.' 等前缀让图更清晰
         short_name = layer_name.replace('features.', 'F').replace('dense.', 'D').replace('classifier.', 'C')
         plt.plot(layer_data['epoch'], layer_data['l2_norm'], label=short_name, marker='o', markersize=3)
-
     plt.title('Layer L2 Norm Evolution During Training')
     plt.xlabel('Epoch')
     plt.ylabel('L2 Norm')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')  # 图例放在外侧防止遮挡
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
-
-    plot_path = os.path.join(save_dir, 'l2_evolution_plot.png')
-    plt.savefig(plot_path, dpi=300)
-    print(f"[Analysis] 趋势图已保存至: {plot_path}")
+    plt.savefig(os.path.join(save_dir, 'l2_evolution_plot.png'), dpi=300)
 
 
 # ================= 主函数 =================
@@ -155,10 +201,11 @@ def main():
                           weight_decay=CONFIG['weight_decay'])
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
 
-    # 用于存储每一轮的L2数据
     l2_history = []
 
-    print(f"开始训练 {CONFIG['epochs']} 轮，并将记录每一轮的参数变化...")
+    print(f"开始训练 {CONFIG['epochs']} 轮...")
+    print("注意：每轮结束后将基于纯 L2 范数动态输出关键层/鲁棒层划分")
+
     start_time = time.time()
 
     for epoch in range(CONFIG['epochs']):
@@ -168,19 +215,29 @@ def main():
         # 2. 验证
         val_loss, val_acc = evaluate(model, testloader, criterion, device)
 
-        # 3. 【核心步骤】记录本轮的 L2 范数
+        # 3. 记录历史数据
         record_layer_l2_norms(model, epoch, l2_history)
+
+        # 4. 【实时输出】 计算并打印本轮的分层结果
+        critical_layers, robust_layers, thresh = classify_layers_realtime(model)
+
+        print(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+        print(f"=" * 20 + " 动态分层 (Only L2) " + "=" * 20)
+        print(f"划分阈值 (Threshold): {thresh:.4f}")
+        print(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
+        # 打印前5个和后5个，避免刷屏，或者根据层数决定是否全打印
+        # 这里为了直观，如果层数不多则全打印，VGG层数较多，我们可以紧凑打印
+        print(", ".join([x.split(' ')[0] for x in critical_layers]))  # 只打印名字
+
+        print(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
+        # 打印鲁棒层的数量和简要信息
+        print(f"Includes {len(robust_layers)} layers with L2 < {thresh:.4f}")
+        print("=" * 60 + "\n")
 
         scheduler.step()
 
-        print(f"Epoch {epoch + 1}: Train Acc {train_acc:.2f}% | Val Acc {val_acc:.2f}%")
-
-        # 可选：保存最佳模型 (省略以保持代码简洁，可复用之前的逻辑)
-
     total_time = time.time() - start_time
-    print(f"\n训练结束，耗时 {total_time / 60:.2f} 分钟。正在生成分析报告...")
-
-    # 4. 训练结束后，生成文件和图片
+    print(f"\n训练结束，耗时 {total_time / 60:.2f} 分钟。")
     save_and_plot_analysis(l2_history, CONFIG['analysis_path'])
 
 
