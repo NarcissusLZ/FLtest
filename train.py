@@ -24,11 +24,12 @@ CONFIG = {
     'weight_decay': 5e-4,
     'save_path': './checkpoints_cifar100',
     'analysis_path': './analysis_results_cifar100',
-    'log_file': 'layer_split_log_refined.txt',  # 新日志文件
+    'log_file': 'layer_split_log_final.txt',
     'num_workers': 2
 }
 
 
+# ... (数据加载和训练函数保持不变，省略以节省篇幅，直接使用之前的即可) ...
 def get_data_loaders(batch_size, num_workers):
     print("正在准备 CIFAR-100 数据...")
     cifar100_mean = (0.5071, 0.4867, 0.4408)
@@ -94,95 +95,13 @@ def log_and_print(message, log_path):
         f.write(message + '\n')
 
 
-# ================= 改进的核心算法：3-Class Clustering & Filter BN =================
-
-def kmeans_split_3_levels(values):
-    """
-    K-Means with k=3 (Low, Mid, High)
-    返回两个阈值: low_mid_thresh, mid_high_thresh
-    """
-    data = np.array(values).reshape(-1, 1)
-    if len(data) < 3: return data[0][0]  # 数据太少不聚类
-
-    # 初始化三个中心: Min, Median, Max
-    c1 = np.min(data)
-    c2 = np.median(data)
-    c3 = np.max(data)
-
-    for _ in range(15):
-        dist1 = np.abs(data - c1)
-        dist2 = np.abs(data - c2)
-        dist3 = np.abs(data - c3)
-
-        # 归类
-        labels = np.argmin(np.vstack((dist1.T, dist2.T, dist3.T)), axis=0)
-
-        # 更新中心
-        new_c1 = data[labels == 0].mean() if np.any(labels == 0) else c1
-        new_c2 = data[labels == 1].mean() if np.any(labels == 1) else c2
-        new_c3 = data[labels == 2].mean() if np.any(labels == 2) else c3
-
-        if c1 == new_c1 and c2 == new_c2 and c3 == new_c3:
-            break
-        c1, c2, c3 = new_c1, new_c2, new_c3
-
-    # 确保 c1 < c2 < c3
-    centers = sorted([c1, c2, c3])
-
-    # 我们只关心 High 组的分界线 (High Threshold)
-    # 取 Mid 和 High 的中间点作为关键层的门槛
-    critical_threshold = (centers[1] + centers[2]) / 2
-    return critical_threshold
-
-
-def classify_layers_refined(model):
-    """
-    改进版分类逻辑：
-    1. 排除 1D 参数 (Batch Norm)，只分析 Conv 和 Dense
-    2. 使用 k=3 聚类，只有 Top Cluster 被判定为 Critical
-    """
-    layer_scores = {}
-    score_values = []
-
-    for name, param in model.named_parameters():
-        if 'weight' in name:
-            # 【关键修改】 剔除 BN 层 (ndim=1)
-            if len(param.shape) <= 1:
-                continue
-
-            l2_val = param.norm(p=2).item()
-            num_params = param.numel()
-            # 计算能量密度 RMS
-            rms_val = (l2_val / np.sqrt(num_params)) * 100
-
-            layer_scores[name] = rms_val
-            score_values.append(rms_val)
-
-    # 计算高阶阈值 (筛选真正的 Top Tier)
-    threshold = kmeans_split_3_levels(score_values)
-
-    critical = []
-    robust = []
-
-    for name, val in layer_scores.items():
-        if val >= threshold:
-            critical.append(f"{name} ({val:.2f})")
-        else:
-            robust.append(f"{name} ({val:.2f})")
-
-    return critical, robust, threshold
-
-
 def record_layer_metrics(model, epoch, history_list):
+    # 此函数仅用于记录原始数据，不做加权，保证 CSV 数据的纯净性
     for name, param in model.named_parameters():
-        if 'weight' in name:
-            # 同样只记录主要层
-            if len(param.shape) <= 1: continue
-
+        if 'weight' in name and len(param.shape) > 1:
             l2_val = param.norm(p=2).item()
             num_params = param.numel()
             rms_val = (l2_val / np.sqrt(num_params)) * 100
-
             history_list.append({
                 'epoch': epoch + 1,
                 'layer': name,
@@ -192,54 +111,108 @@ def record_layer_metrics(model, epoch, history_list):
 
 
 def save_and_plot_analysis(history_list, save_dir):
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
     df = pd.DataFrame(history_list)
-    csv_path = os.path.join(save_dir, 'training_metrics_refined.csv')
-    df.to_csv(csv_path, index=False)
+    df.to_csv(os.path.join(save_dir, 'training_metrics_final.csv'), index=False)
+    # (绘图代码略，与之前相同)
 
-    plt.figure(figsize=(12, 8))
-    layers = df['layer'].unique()
-    for layer_name in layers:
-        layer_data = df[df['layer'] == layer_name]
-        short_name = layer_name.replace('features.', 'F').replace('dense.', 'D').replace('classifier.', 'C')
-        plt.plot(layer_data['epoch'], layer_data['rms_score'], label=short_name, marker='o', markersize=3)
-    plt.title('Layer RMS Score Evolution (Conv & Dense Only)')
-    plt.xlabel('Epoch')
-    plt.ylabel('RMS Score')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize='small')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'rms_refined_plot.png'), dpi=300)
+
+# ================= 【核心修改】 混合加权评分策略 =================
+
+def kmeans_split_auto(values):
+    """自动 K-Means (k=2)"""
+    data = np.array(values).reshape(-1, 1)
+    if len(data) < 2: return data[0][0]
+
+    # 简单的 k=2 聚类
+    c1, c2 = np.min(data), np.max(data)
+    for _ in range(10):
+        dist1 = np.abs(data - c1)
+        dist2 = np.abs(data - c2)
+        group1 = data[dist1 <= dist2]
+        group2 = data[dist1 > dist2]
+        new_c1 = group1.mean() if len(group1) > 0 else c1
+        new_c2 = group2.mean() if len(group2) > 0 else c2
+        if c1 == new_c1 and c2 == new_c2: break
+        c1, c2 = new_c1, new_c2
+
+    return (c1 + c2) / 2
+
+
+def classify_layers_final(model):
+    layer_scores = {}
+    score_values = []
+
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            # 1. 过滤掉 BN 层 (一维参数)
+            if len(param.shape) <= 1: continue
+
+            # 2. 计算基础 RMS 分数 (能量密度)
+            l2_val = param.norm(p=2).item()
+            num_params = param.numel()
+            base_score = (l2_val / np.sqrt(num_params)) * 100
+
+            # 3. 应用位置加权 (Positional Weighting)
+            # 这是为了弥补纯统计指标的不足，符合 "First & Last layers matter most" 原则
+            weighted_score = base_score
+
+            if "dense" in name or "classifier" in name:
+                weighted_score *= 2.0  # 全连接层大幅加分
+            elif "features.3" in name or "features.4" in name:
+                # 深层卷积 (根据VGG结构，30层往后算深层)
+                # 这里简单通过序号判断，VGG16 features结构比较长
+                # 我们可以解析名字中的数字，数字大的加分
+                try:
+                    layer_idx = int(name.split('.')[1])
+                    if layer_idx > 20:  # 假设20层以后的卷积更重要
+                        weighted_score *= 1.3
+                except:
+                    pass
+            elif "features.0" in name:
+                weighted_score *= 1.5  # 第一层极其重要，加分
+
+            layer_scores[name] = weighted_score
+            score_values.append(weighted_score)
+
+    # 4. 动态阈值划分
+    threshold = kmeans_split_auto(score_values)
+
+    critical = []
+    robust = []
+
+    for name, val in layer_scores.items():
+        if val >= threshold:
+            critical.append(f"{name}")  # 简洁输出
+        else:
+            robust.append(f"{name}")
+
+    return critical, robust, threshold
 
 
 # ================= 主函数 =================
 def main():
     device = select_device(CONFIG['device'])
-    print(f"Using device: {device}")
-
     if not os.path.exists(CONFIG['save_path']): os.makedirs(CONFIG['save_path'])
     if not os.path.exists(CONFIG['analysis_path']): os.makedirs(CONFIG['analysis_path'])
 
     log_path = os.path.join(CONFIG['analysis_path'], CONFIG['log_file'])
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write(f"Training Log (Refined) - {datetime.datetime.now()}\n")
-        f.write("Strategy: RMS Score + BN Filtering + K-Means(k=3)\n")
-        f.write("Target: Filter out small BN layers, select only Top-Tier Conv/Dense.\n")
+        f.write(f"Training Log (Final) - {datetime.datetime.now()}\n")
+        f.write("Strategy: RMS Score * Positional Weights (Heuristic)\n")
+        f.write("Weights: Dense(x2.0), DeepConv(x1.3), FirstConv(x1.5)\n")
         f.write("=" * 60 + "\n")
 
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
-    model = CIFAR100_VGG16(num_classes=100).to(device)
+    model = CIFAR100_VGG16(num_classes=100).to(device)  # 使用 CIFAR100 模型
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=CONFIG['lr'], momentum=CONFIG['momentum'],
                           weight_decay=CONFIG['weight_decay'])
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
-
     history = []
 
-    log_and_print(f"开始训练 (Refined 策略)...", log_path)
-
+    log_and_print(f"开始训练 (Final 策略)...", log_path)
     start_time = time.time()
 
     for epoch in range(CONFIG['epochs']):
@@ -247,21 +220,14 @@ def main():
         val_loss, val_acc = evaluate(model, testloader, criterion, device)
 
         record_layer_metrics(model, epoch, history)
-        critical_layers, robust_layers, thresh = classify_layers_refined(model)
+        critical_layers, robust_layers, thresh = classify_layers_final(model)
 
         msg = []
         msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        msg.append(f"=" * 20 + " 动态分层 (Refined) " + "=" * 20)
-        msg.append(f"Top-Tier 阈值: {thresh:.4f}")
-        msg.append(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
-        msg.append(", ".join([x.split(' ')[0] for x in critical_layers]))
-        msg.append(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
-        # 显示一部分鲁棒层
-        if len(robust_layers) > 0:
-            msg.append(", ".join([x.split(' ')[0] for x in robust_layers]))
-        else:
-            msg.append("None")
-        msg.append("=" * 60)
+        msg.append(f"Threshold: {thresh:.2f}")
+        msg.append(f"🔴 Critical (TCP): {', '.join(critical_layers)}")
+        msg.append(f"🟢 Robust (UDP):  {', '.join(robust_layers)}")
+        msg.append("-" * 60)
 
         log_and_print("\n".join(msg), log_path)
         scheduler.step()
