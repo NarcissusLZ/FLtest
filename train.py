@@ -13,6 +13,7 @@ import numpy as np
 import datetime
 
 # 导入你的模型文件
+# 确保 vgg16.py 在同一目录下，或者调整引用路径
 from vgg16 import CIFAR10_VGG16, select_device
 
 # ================= 配置参数 =================
@@ -25,8 +26,9 @@ CONFIG = {
     'weight_decay': 5e-4,
     'save_path': './checkpoints',
     'analysis_path': './analysis_results',
-    'log_file': 'layer_split_log.txt',  # 新增：日志文件名
-    'num_workers': 2
+    'log_file': 'layer_split_ratio_log.txt',  # 日志文件名已更新
+    'num_workers': 2,
+    'critical_ratio': 0.3  # 【新增】关键层比例：前 30% (L2最大的) 走 TCP
 }
 
 
@@ -98,54 +100,53 @@ def log_and_print(message, log_path):
         f.write(message + '\n')  # 文件写入
 
 
-# ================= 核心逻辑：动态分层算法 =================
-def simple_kmeans_split(values):
-    """简单的1D K-Means (k=2) 实现"""
-    data = np.array(values).reshape(-1, 1)
-    c1 = np.min(data)
-    c2 = np.max(data)
-    for _ in range(10):
-        dist1 = np.abs(data - c1)
-        dist2 = np.abs(data - c2)
-        group1 = data[dist1 <= dist2]
-        group2 = data[dist1 > dist2]
-        new_c1 = group1.mean() if len(group1) > 0 else c1
-        new_c2 = group2.mean() if len(group2) > 0 else c2
-        if c1 == new_c1 and c2 == new_c2: break
-        c1, c2 = new_c1, new_c2
-    threshold = (c1 + c2) / 2
-    return threshold
-
-
-def classify_layers_realtime(model):
-    """获取当前L2并分类"""
-    layer_l2 = {}
-    l2_values = []
+# ================= 核心逻辑：Top-K 比例分层算法 (忽略BN) =================
+def classify_layers_by_ratio(model, ratio):
+    """
+    按L2范数从大到小排序，取前 ratio% 为关键层。
+    忽略 BN 层 (通过维度判断，BN weight是1维，Conv/Linear是2维以上)
+    """
+    layer_info = []
 
     for name, param in model.named_parameters():
-        if 'weight' in name:
+        # 1. 筛选逻辑：
+        # 'weight' in name: 排除 bias
+        # param.dim() > 1: 排除 BN 的 weight (BN的weight是1维的，Conv/Linear是2维或4维)
+        if 'weight' in name and param.dim() > 1:
             val = param.norm(p=2).item()
-            layer_l2[name] = val
-            l2_values.append(val)
+            layer_info.append((name, val))
 
-    threshold = simple_kmeans_split(l2_values)
+    # 2. 排序：从大到小 (High to Low)
+    layer_info.sort(key=lambda x: x[1], reverse=True)
 
-    critical = []
-    robust = []
+    # 3. 计算切分点
+    num_total = len(layer_info)
+    num_critical = int(num_total * ratio)
 
-    for name, val in layer_l2.items():
-        if val >= threshold:
-            critical.append(f"{name} ({val:.2f})")
-        else:
-            robust.append(f"{name} ({val:.2f})")
+    # 边界保护：如果比例>0但计算结果为0，至少保留1层
+    if num_critical == 0 and ratio > 0 and num_total > 0:
+        num_critical = 1
 
-    return critical, robust, threshold
+    # 4. 切分列表
+    critical_list = layer_info[:num_critical]
+    robust_list = layer_info[num_critical:]
+
+    # 5. 格式化输出 (Name, Value)
+    critical_desc = [f"{n} ({v:.2f})" for n, v in critical_list]
+    robust_desc = [f"{n} ({v:.2f})" for n, v in robust_list]
+
+    # 获取当前的分界阈值（即关键层中最小的那个值，用于日志展示）
+    # 如果 critical_list 为空，则阈值为无穷大或0
+    current_threshold = critical_list[-1][1] if critical_list else 0.0
+
+    return critical_desc, robust_desc, current_threshold
 
 
 def record_layer_l2_norms(model, epoch, history_list):
     """记录数据用于事后绘图"""
     for name, param in model.named_parameters():
-        if 'weight' in name:
+        # 同样只记录 Conv/Linear 的权重，保持逻辑一致
+        if 'weight' in name and param.dim() > 1:
             l2_val = param.norm(p=2).item()
             history_list.append({
                 'epoch': epoch + 1,
@@ -186,10 +187,11 @@ def main():
 
     # 初始化日志文件路径
     log_path = os.path.join(CONFIG['analysis_path'], CONFIG['log_file'])
-    # 清空之前的日志（如果需要保留追加，去掉这行 'w' 模式的写入）
+
+    # 写入日志头
     with open(log_path, 'w', encoding='utf-8') as f:
         f.write(f"Training Log - Started at {datetime.datetime.now()}\n")
-        f.write("Strategy: Real-time Dynamic Split based on Pure L2 Norm\n")
+        f.write(f"Strategy: Dynamic Split based on Top {CONFIG['critical_ratio'] * 100}% Ratio (Ignoring BN)\n")
         f.write("=" * 60 + "\n")
 
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
@@ -217,21 +219,21 @@ def main():
         # 3. 记录历史数据
         record_layer_l2_norms(model, epoch, l2_history)
 
-        # 4. 【实时输出】 计算并打印本轮的分层结果
-        critical_layers, robust_layers, thresh = classify_layers_realtime(model)
+        # 4. 【实时输出】 计算并打印本轮的分层结果 (使用新的比例函数)
+        critical_layers, robust_layers, thresh = classify_layers_by_ratio(model, CONFIG['critical_ratio'])
 
         # 构建要打印和保存的日志信息
         msg = []
         msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        msg.append(f"=" * 20 + " 动态分层 (Only L2) " + "=" * 20)
-        msg.append(f"当前轮次 L2 阈值 (Threshold): {thresh:.4f}")
+        msg.append(f"=" * 20 + f" 动态分层 (Top {CONFIG['critical_ratio'] * 100:.0f}%) " + "=" * 20)
+        msg.append(f"当前分界阈值 (Min Critical L2): {thresh:.4f}")
 
         msg.append(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
-        # 记录所有关键层名字
+        # 记录所有关键层名字，格式化去掉多余的空格
         msg.append(", ".join([x.split(' ')[0] for x in critical_layers]))
 
         msg.append(f"🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
-        # 鲁棒层通常较多，如果不希望日志太长，可以只记名字
+        # 鲁棒层
         msg.append(", ".join([x.split(' ')[0] for x in robust_layers]))
 
         msg.append("=" * 60)
