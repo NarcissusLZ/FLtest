@@ -28,7 +28,7 @@ CONFIG = {
     'analysis_path': './analysis_results',
     'log_file': 'layer_split_ratio_log.txt',  # 日志文件名已更新
     'num_workers': 2,
-    'critical_ratio': 0.3  # 【新增】关键层比例：前 30% (L2最大的) 走 TCP
+    'critical_ratio': 0.6  # 【新增】关键层比例：前 30% (L2最大的) 走 TCP
 }
 
 
