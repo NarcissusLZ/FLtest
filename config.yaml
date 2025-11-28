@@ -1,0 +1,50 @@
+# 设备配置
+device: "cuda"             # 训练设备 (cpu, cuda, mps)
+
+# 数据集配置
+dataset: "cifar10"        # 数据集名称 (mnist, fashion-mnist, cifar10, cifar100)
+data_dir: "./datasets"    # 数据集存储目录
+
+# 训练超参数
+batch_size: 50            # 批次大小
+lr: 0.01                  # 学习率
+momentum: 0.9             # 动量
+local_epochs: 1           # 本地训练轮次
+random_seed: 42
+
+# 联邦学习配置
+num_rounds: 100           # 全局训练轮次
+num_clients: 100           # 客户端总数
+client_fraction: 0.2      # 每轮选择的客户端比例 (choose_number/num_clients = 10/20 = 0.5)
+non_iid: False             # 是否使用非独立同分布数据
+non_iid_alpha: 1        # 非独立同分布程度 (值越小越非独立)
+
+# 模型配置
+model: "VGG16"    # 模型架构
+
+# 其他配置
+max_grad_norm: 5.0        # 梯度裁剪阈值
+result_dir: "./results"   # 结果保存目录
+num_workers: 4            # 数据加载工作进程数
+test_batch_size: 128      # 测试批次大小
+
+Transport: TCP            #TCP/UDP/LTQ
+
+# LTQ自适应策略配置
+ltq_phase_method: 'rounds'  # 'rounds', 'accuracy', 'hybrid'
+
+# 基于轮次的配置
+ltq_early_ratio: 0.2    # 前30%轮次为早期
+ltq_middle_ratio: 0.5   # 中50%轮次为中期
+
+# 基于精度的配置  
+ltq_early_acc_threshold: 30.0   # 精度低于25%为早期
+ltq_middle_acc_threshold: 75.0  # 精度低于55%为中期
+
+layers_to_drop:           # 指定要丢弃的层，支持部分名称匹配
+  - "features.27"
+  - "features.30"
+  - "features.34"
+  - "features.35"
+  - "features.37"
+  - "features.40"

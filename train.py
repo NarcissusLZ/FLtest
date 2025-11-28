@@ -31,7 +31,7 @@ CONFIG = {
     'num_workers': 2,
 
     # === 核心算法参数 (Innovation Points) ===
-    'critical_ratio': 0.3,  # 关键层比例 (Top 30%)
+    'critical_ratio': 0.5,  # 关键层比例 (Top 30%)
 
     # 梯度权重 (Gradient Importance Beta)
     # Score = Norm(Movement) + beta * Norm(Gradient)

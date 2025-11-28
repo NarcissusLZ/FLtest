@@ -109,7 +109,7 @@ class CIFAR100_VGG16(nn.Module):
 if __name__ == '__main__':
     model = CIFAR10_VGG16()
     # 获取配置参数
-    with open("../config.yaml", 'r') as f:
+    with open("./config.yaml", 'r') as f:
         conf = yaml.safe_load(f)
 
     device_config = conf.get('device').lower()
