@@ -31,12 +31,11 @@ CONFIG = {
     'num_workers': 2,
 
     # === 核心算法参数 (Innovation Points) ===
-    'critical_ratio': 0.5,  # 关键层比例 (Top 30%)
+    'critical_ratio': 0.5,  # 关键层比例 (Top 50%)
 
     # 梯度权重 (Gradient Importance Beta)
-    # Score = Norm(Movement) + beta * Norm(Gradient)
-    # beta=1.0 表示“变化量”和“敏感度”同等重要
-    # 如果你认为敏感度更重要，可以设为 2.0
+    # Score = Norm(Movement_Step) + beta * Norm(Gradient)
+    # Movement_Step = W_t - W_{t-1} (当前轮的变化幅度)
     'grad_beta': 1.0
 }
 
@@ -108,19 +107,27 @@ def evaluate(model, dataloader, criterion, device):
 # ================= 辅助类：双因子指标计算器 =================
 class LayerMetricCalculator:
     """
-    负责同时跟踪：
-    1. 权重相对于初始化的位移 (Movement) -> 代表 'Learned Feature Magnitude'
-    2. 当前梯度的范数 (Gradient) -> 代表 'Loss Sensitivity'
+    修改后逻辑：
+    1. Movement: 权重相对于上一轮的变化 (W_t - W_{t-1})
+    2. Gradient: 当前梯度的范数 (Loss Sensitivity)
     """
 
     def __init__(self, model):
-        # 冻结并保存初始权重副本 (W_0)
-        print("初始化 MetricCalculator: 正在备份初始权重...")
-        self.initial_weights = {}
+        # 初始化时，prev_weights 就是初始权重 W_0
+        print("初始化 MetricCalculator: 正在备份上一轮权重(W_t-1)...")
+        self.prev_weights = {}
         for name, param in model.named_parameters():
             if 'weight' in name and param.dim() > 1:
                 # 存到CPU节省显存
-                self.initial_weights[name] = param.data.clone().detach().cpu()
+                self.prev_weights[name] = param.data.clone().detach().cpu()
+
+    def update_prev_weights(self, model):
+        """
+        每轮结束后调用，将当前权重更新为“上一轮权重”，供下一轮计算差值使用
+        """
+        for name, param in model.named_parameters():
+            if name in self.prev_weights:
+                self.prev_weights[name] = param.data.clone().detach().cpu()
 
     def get_dual_metrics(self, model):
         """
@@ -133,11 +140,12 @@ class LayerMetricCalculator:
             if 'weight' not in name or param.dim() <= 1:
                 continue
 
-            # --- 因子1: Movement (W_t - W_0) ---
+            # --- 因子1: Movement (W_t - W_{t-1}) ---
+            # 修改：计算当前权重与 prev_weights 的差值
             movement = 0.0
-            if name in self.initial_weights:
-                init_w = self.initial_weights[name].to(param.device)
-                movement = torch.norm(param.data - init_w, p=2).item()
+            if name in self.prev_weights:
+                prev_w = self.prev_weights[name].to(param.device)
+                movement = torch.norm(param.data - prev_w, p=2).item()
 
             # --- 因子2: Gradient Norm (Sensitivity) ---
             grad_val = 0.0
@@ -156,13 +164,8 @@ class LayerMetricCalculator:
 # ================= 核心逻辑：双因子融合分层算法 =================
 def classify_layers_dual_factor(model, metric_calculator, ratio, grad_beta):
     """
-    基于 [Weight Movement] 和 [Gradient Sensitivity] 的融合分层。
-
-    Logic:
-    1. 获取每一层的 Movement 和 Gradient 值。
-    2. 对两者分别进行 Min-Max 归一化 (映射到 0~1)。
-    3. 综合得分 Score = Norm(Movement) + beta * Norm(Gradient)。
-    4. 排序并切分。
+    基于 [Weight Increment] 和 [Gradient Sensitivity] 的融合分层。
+    Score = Norm(W_t - W_{t-1}) + beta * Norm(Gradient)
     """
     # 1. 获取原始数据
     raw_data = metric_calculator.get_dual_metrics(model)
@@ -183,7 +186,6 @@ def classify_layers_dual_factor(model, metric_calculator, ratio, grad_beta):
         norm_grad = item['grad'] / max_grad
 
         # === 核心公式 ===
-        # 既保护变化大的，也保护梯度大的(敏感的)
         combined_score = norm_mov + (grad_beta * norm_grad)
 
         final_scores.append({
@@ -204,10 +206,10 @@ def classify_layers_dual_factor(model, metric_calculator, ratio, grad_beta):
     robust_list = final_scores[num_critical:]
 
     # 5. 格式化输出 (Name | Score | Movement | Gradient)
-    # 为了日志整洁，保留两位小数
-    critical_desc = [f"{x['name']} (S:{x['score']:.2f}|M:{x['raw_mov']:.2f}|G:{x['raw_grad']:.2f})" for x in
+    critical_desc = [f"{x['name']} (S:{x['score']:.2f}|Mov:{x['raw_mov']:.4f}|G:{x['raw_grad']:.2f})" for x in
                      critical_list]
-    robust_desc = [f"{x['name']} (S:{x['score']:.2f}|M:{x['raw_mov']:.2f}|G:{x['raw_grad']:.2f})" for x in robust_list]
+    robust_desc = [f"{x['name']} (S:{x['score']:.2f}|Mov:{x['raw_mov']:.4f}|G:{x['raw_grad']:.2f})" for x in
+                   robust_list]
 
     threshold = critical_list[-1]['score'] if critical_list else 0.0
 
@@ -227,7 +229,6 @@ def save_and_plot_analysis(history_list, save_dir):
     df = pd.DataFrame(history_list)
     csv_path = os.path.join(save_dir, 'layer_scores_history.csv')
     df.to_csv(csv_path, index=False)
-    # 这里省略了复杂的绘图代码，只保存数据，以免代码过长
 
 
 # ================= 主函数 =================
@@ -243,7 +244,7 @@ def main():
     trainloader, testloader = get_data_loaders(CONFIG['batch_size'], CONFIG['num_workers'])
     model = CIFAR10_VGG16(num_classes=10).to(device)
 
-    # 2. 【关键步骤】 初始化指标计算器 (保存 W_0)
+    # 2. 【关键步骤】 初始化指标计算器 (保存 W_0 作为第一轮的 W_{t-1})
     metric_calc = LayerMetricCalculator(model)
 
     criterion = nn.CrossEntropyLoss()
@@ -254,7 +255,7 @@ def main():
     # 记录日志头
     with open(log_path, 'w', encoding='utf-8') as f:
         f.write(f"Training Log - {datetime.datetime.now()}\n")
-        f.write(f"Strategy: Dual-Factor Metric (Movement + Beta*Gradient)\n")
+        f.write(f"Strategy: Dual-Factor Metric (Incremental Movement + Beta*Gradient)\n")
         f.write(f"Params: Ratio={CONFIG['critical_ratio']}, Beta={CONFIG['grad_beta']}\n")
         f.write("=" * 60 + "\n")
 
@@ -272,7 +273,7 @@ def main():
         val_loss, val_acc = evaluate(model, testloader, criterion, device)
 
         # --- 【核心】执行双因子分层算法 ---
-        # 此时 model.parameters().grad 中存有梯度的值
+        # 这里的计算基于：W_t (当前) - W_{t-1} (MetricCalc中保存的)
         critical_layers, robust_layers, thresh = classify_layers_dual_factor(
             model,
             metric_calc,
@@ -280,19 +281,18 @@ def main():
             CONFIG['grad_beta']
         )
 
-        # 简单的记录历史用于debug (只记第一层的分值)
-        # 实际使用可以扩展记录所有层
-        # score_history.append(...)
+        # --- 【重要修改】更新 W_{t-1} ---
+        # 计算完本轮的分层后，立即将当前权重保存为 "上一轮权重"，供下一轮使用
+        metric_calc.update_prev_weights(model)
 
         # --- 构建日志 ---
         msg = []
         msg.append(f"\n[{epoch + 1}/{CONFIG['epochs']}] Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-        msg.append(f"=" * 10 + f" 双因子分层 (Movement + {CONFIG['grad_beta']}*Grad) " + "=" * 10)
+        msg.append(f"=" * 10 + f" 双因子分层 (W_t-W_{{t-1}} + {CONFIG['grad_beta']}*Grad) " + "=" * 10)
         msg.append(f"当前分界 Score: {thresh:.4f}")
 
         msg.append(f"🔴 关键层 (Critical/TCP, Count={len(critical_layers)}):")
         # 打印详细信息: Name (Score|Mov|Grad)
-        # 使用 join 换行打印前几个，避免太长
         msg.append("\n".join(critical_layers))
 
         msg.append(f"\n🟢 鲁棒层 (Robust/UDP, Count={len(robust_layers)}):")
